@@ -1,0 +1,95 @@
+name: Deploy anna.games
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Собрать заново, даже если версия не менялась'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  actions: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.src.outputs.sha }}
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - id: src
+        run: echo "sha=$(git ls-remote https://github.com/cathypankova-fanka/zuba-slonya.git refs/heads/main | cut -f1)" >> "$GITHUB_OUTPUT"
+      - id: seen
+        uses: actions/cache/restore@v4
+        with:
+          path: deployed.txt
+          key: deployed-${{ steps.src.outputs.sha }}
+          lookup-only: true
+      - id: decide
+        run: |
+          if [ "${{ steps.seen.outputs.cache-hit }}" = "true" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"; echo "Версия ${{ steps.src.outputs.sha }} уже на anna.games"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: cathypankova-fanka/zuba-slonya
+          ref: ${{ needs.check.outputs.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --legacy-peer-deps
+      - run: npm run build
+        env:
+          VITE_BASE: /
+      - run: echo "anna.games" > dist/CNAME
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+      - run: echo "${{ needs.check.outputs.sha }}" > deployed.txt
+      - uses: actions/cache/save@v4
+        with:
+          path: deployed.txt
+          key: deployed-${{ needs.check.outputs.sha }}
+
+  # GitHub выключает расписание в репозитории без коммитов 60 дней — раз в месяц отмечаемся
+  keepalive:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $((30*24*3600)) ]; then
+            date -u +%F > .keepalive
+            git config user.name github-actions; git config user.email github-actions@users.noreply.github.com
+            git add .keepalive && git commit -m "keepalive" && git push
+          fi
